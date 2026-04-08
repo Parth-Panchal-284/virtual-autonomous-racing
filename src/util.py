@@ -17,7 +17,7 @@ class CurrentRunFolder:
         return str(pathlib.Path(self.run_folder, filename))
     
     def get_date_file_name(self, extension:str, subfolder:str|None=None):
-        filename = datetime.now().strftime("%Y-%m-%d|%H:%M:%S") + "." + extension
+        filename = datetime.now().strftime("%Y-%m-%d-%H_%M_%S") + "." + extension
         return self.get_file_name(filename, subfolder)
 
 if __name__ == "__main__":
