@@ -52,9 +52,11 @@ def split_obs(obs):
         return [], [np.array(obs, dtype=np.float32).flatten()]
 
     img_arrays, vec_arrays = [], []
+    
     for o in obs:
+        # print(o.shape)
         arr = np.array(o, dtype=np.float32)
-        if arr.size >= 1000:
+        if arr.ndim >= 2:
             img_arrays.append(arr)
         else:
             vec_arrays.append(arr.flatten())
@@ -71,13 +73,7 @@ def obs_to_tensors(obs, device):
 
     img_t = None
     if img_arrays:
-        frames = []
-        for img in img_arrays:
-            if img.ndim == 3:
-                img = img[0]      # (1,H,W) -> (H,W)
-            frames.append(img)
-        stacked = np.stack(frames, axis=0)                          # (C, H, W)
-        img_t = torch.from_numpy(stacked).unsqueeze(0).to(device)  # (1, C, H, W)
+        img_t = torch.from_numpy(np.array(img_arrays)).to(device)
 
     vec_t = None
     if vec_arrays:
@@ -96,11 +92,10 @@ def probe_obs_dims(obs):
 
     img_channels = img_h = img_w = None
     if img_arrays:
-        img_channels = len(img_arrays)
+        img_channels = img_arrays[0].shape[0]
         first = np.array(img_arrays[0], dtype=np.float32)
-        if first.ndim == 3:
-            first = first[0]
-        img_h, img_w = first.shape
+        print(first.shape)
+        img_h, img_w = first.shape[1], first.shape[2]
 
     vec_dim = None
     if vec_arrays:
@@ -145,8 +140,8 @@ class VecStream(nn.Module):
     def __init__(self, vec_dim: int, out_dim: int = 64):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(vec_dim, 128), nn.Tanh(),
-            nn.Linear(128, out_dim), nn.Tanh(),
+            nn.Linear(vec_dim, 128), nn.ReLU(),
+            nn.Linear(128, out_dim), nn.ReLU(),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -528,8 +523,10 @@ class PPOTrainer:
 if __name__ == "__main__":
     import tmrl
     import pathlib
+    from tmrl.config.config_objects import CONFIG_DICT
+    print(CONFIG_DICT)
     
-    s = datetime.now().strftime("%Y-%m-%d|%H:%M:%S")
+    s = datetime.now().strftime("%Y-%m-%d-%H_%M_%S")
     current_run_folder = CurrentRunFolder(str(pathlib.Path("runs", s)))
     
     env = tmrl.get_environment()

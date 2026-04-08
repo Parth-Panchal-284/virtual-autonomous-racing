@@ -5,7 +5,7 @@ import pathlib
 class CurrentRunFolder:
     def __init__(self, run_folder: str):
         self.run_folder = run_folder
-        self._create_run_folders
+        self._create_run_folders()
     
     def _create_run_folders(self):
         os.makedirs(self.run_folder, exist_ok=True)
