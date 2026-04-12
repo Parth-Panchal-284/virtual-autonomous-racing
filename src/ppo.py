@@ -36,6 +36,93 @@ from datetime import datetime
 from util import CurrentRunFolder
 
 
+
+# ─────────────────────────────────────────────
+# Crash penalty wrapper
+# ─────────────────────────────────────────────
+ 
+class CrashPenaltyWrapper:
+    """
+    Wraps a tmrl environment and adds a speed-scaled penalty on crash.
+ 
+    How it works
+    ------------
+    tmrl signals a crash via `terminated=True`.  At that moment we read
+    the current speed from the observation and subtract:
+ 
+        penalty = base_penalty + speed_coef * speed_kmh
+ 
+    where speed_kmh is extracted from the first scalar in the obs tuple
+    (tmrl's default layout puts speed first, in km/h).
+ 
+    Parameters
+    ----------
+    env         : the raw tmrl environment
+    base_penalty: flat penalty applied on any crash              (default 50)
+    speed_coef  : extra penalty per km/h of speed at crash time  (default  1)
+    max_penalty : ceiling so a single crash can't dominate       (default 200)
+ 
+    Example penalty curve
+    ---------------------
+      0 km/h crash  →  -50
+     50 km/h crash  → -100
+    150 km/h crash  → -200  (capped)
+    """
+ 
+    def __init__(self, env, base_penalty: float = 50.0,
+                 speed_coef: float = 1.0, max_penalty: float = 200.0):
+        self.env          = env
+        self.base_penalty = base_penalty
+        self.speed_coef   = speed_coef
+        self.max_penalty  = max_penalty
+        # Forward standard gym attributes
+        self.action_space      = env.action_space
+        self.observation_space = env.observation_space
+        
+        self.last_speed = 0
+        
+        self.frames_since_last_crash = 10000
+ 
+    def _get_speed(self, obs) -> float:
+        """Extract speed (km/h) from obs. Assumes speed is the first scalar."""
+        if isinstance(obs, (tuple, list)):
+            speed_arr = np.array(obs[0], dtype=np.float32).flatten()
+            return float(speed_arr[0])
+        return float(np.array(obs, dtype=np.float32).flatten()[0])
+ 
+    def reset(self, **kwargs):
+        
+        self.frames_since_last_crash = 10000
+        self.last_speed = 0
+        return self.env.reset(**kwargs)
+    
+    def determine_crash(self, speed):
+        difference = (speed - self.last_speed) * 15
+        return difference < -25 and 3 < speed and 30 < self.frames_since_last_crash
+        
+ 
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+ 
+
+        speed     = self._get_speed(obs)
+        if(self.determine_crash(speed)):
+            self.frames_since_last_crash = 0
+            penalty   = self.base_penalty + self.speed_coef * abs(speed)
+            penalty   = min(penalty, self.max_penalty)
+            print(f"\n\nCRASHED: {speed} mph, Penalty: {penalty}, Rewqard: {reward}")
+            reward   -= penalty
+            info["crash_penalty"] = penalty
+            info["crash_speed"]   = speed
+ 
+        self.last_speed = speed
+        self.frames_since_last_crash += 1
+        return obs, reward, terminated, truncated, info
+ 
+    def close(self):
+        return self.env.close()
+
+
 # ─────────────────────────────────────────────
 # Observation splitter
 # ─────────────────────────────────────────────
@@ -110,47 +197,57 @@ def probe_obs_dims(obs):
 
 class CNNStream(nn.Module):
     """
-    Nature-DQN style CNN for stacked grayscale frames.
+    Deeper CNN for stacked grayscale frames from TrackMania.
+    Wider filters (32->64->128->128) capture richer 3D perspective features
+    compared to the original Nature-DQN (32->64->64).
     Input : (B, C, H, W)  pixel values in [0, 255]
     Output: (B, out_dim)
     """
-    def __init__(self, in_channels: int, img_h: int, img_w: int, out_dim: int = 256):
+    def __init__(self, in_channels: int, img_h: int, img_w: int, out_dim: int = 512):
         super().__init__()
         self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, 32, kernel_size=8, stride=4), nn.ReLU(),
-            nn.Conv2d(32,          64, kernel_size=4, stride=2), nn.ReLU(),
-            nn.Conv2d(64,          64, kernel_size=3, stride=1), nn.ReLU(),
+            nn.Conv2d(in_channels, 32,  kernel_size=8, stride=4), nn.ReLU(),
+            nn.Conv2d(32,          64,  kernel_size=4, stride=2), nn.ReLU(),
+            nn.Conv2d(64,          128, kernel_size=3, stride=1), nn.ReLU(),
+            nn.Conv2d(128,         128, kernel_size=3, stride=1), nn.ReLU(),
             nn.Flatten(),
         )
         with torch.no_grad():
             dummy = torch.zeros(1, in_channels, img_h, img_w)
             flat  = self.conv(dummy).shape[1]
-        self.proj = nn.Sequential(nn.Linear(flat, out_dim), nn.ReLU())
-
+        self.proj = nn.Sequential(
+            nn.Linear(flat, out_dim), nn.ReLU(),
+            nn.Linear(out_dim, out_dim), nn.ReLU(),
+        )
+ 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.proj(self.conv(x / 255.0))
-
-
+ 
+ 
 class VecStream(nn.Module):
     """
-    Small MLP for vector observations (speed, gear, rpm ...).
+    Larger MLP for vector observations (speed, gear, lidar history ...).
+    With 8 history frames of lidar (~152 floats), the original 128->64
+    was a severe bottleneck. Now 256->256->128 to preserve lidar detail.
     Input : (B, D)
     Output: (B, out_dim)
     """
-    def __init__(self, vec_dim: int, out_dim: int = 64):
+    def __init__(self, vec_dim: int, out_dim: int = 128):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(vec_dim, 128), nn.ReLU(),
-            nn.Linear(128, out_dim), nn.ReLU(),
+            nn.Linear(vec_dim, 256), nn.Tanh(),
+            nn.Linear(256,     256), nn.Tanh(),
+            nn.Linear(256, out_dim), nn.Tanh(),
         )
-
+ 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
-
 class DualStreamEncoder(nn.Module):
     """
-    Fuses CNN visual features with MLP state features.
+    Fuses CNN visual features with MLP state features using a deeper fusion MLP.
+    Two fusion layers instead of one give the network room to learn non-trivial
+    interactions between visual context and vehicle state (e.g. speed + corner ahead).
     Either stream can be absent (pass None).
     Output: (B, enc_dim)
     """
@@ -160,7 +257,7 @@ class DualStreamEncoder(nn.Module):
         vec,
         cnn_out_dim: int,
         vec_out_dim: int,
-        enc_dim: int = 256,
+        enc_dim: int = 512,
     ):
         super().__init__()
         self.cnn = cnn
@@ -169,8 +266,9 @@ class DualStreamEncoder(nn.Module):
                     (vec_out_dim if vec is not None else 0)
         self.fusion = nn.Sequential(
             nn.Linear(fusion_in, enc_dim), nn.ReLU(),
+            nn.Linear(enc_dim,   enc_dim), nn.ReLU(),
         )
-
+ 
     def forward(self, img, vec):
         parts = []
         if self.cnn is not None and img is not None:
@@ -192,20 +290,26 @@ class ActorCritic(nn.Module):
     def __init__(self, encoder: DualStreamEncoder, enc_dim: int, action_dim: int):
         super().__init__()
         self.encoder = encoder
-
+ 
+        # Deeper actor head: enc -> 512 -> 256 -> action_dim
+        # Two hidden layers let the policy express more nuanced decisions
         self.actor_mean = nn.Sequential(
-            nn.Linear(enc_dim, 256), nn.Tanh(),
+            nn.Linear(enc_dim, 512), nn.Tanh(),
+            nn.Linear(512,     256), nn.Tanh(),
             nn.Linear(256, action_dim),
         )
-        # Start with std ≈ 0.6 for less chaotic early exploration
+        # Start with std ~ 0.6 for less chaotic early exploration
         self.log_std = nn.Parameter(torch.full((action_dim,), -0.5))
-
+ 
+        # Deeper critic head: enc -> 512 -> 256 -> 1
+        # Value estimation benefits from extra capacity to predict long-horizon returns
         self.critic = nn.Sequential(
-            nn.Linear(enc_dim, 256), nn.Tanh(),
+            nn.Linear(enc_dim, 512), nn.Tanh(),
+            nn.Linear(512,     256), nn.Tanh(),
             nn.Linear(256, 1),
         )
         self._init_weights()
-
+ 
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, (nn.Linear, nn.Conv2d)):
@@ -213,7 +317,7 @@ class ActorCritic(nn.Module):
                 nn.init.zeros_(m.bias)
         nn.init.orthogonal_(self.actor_mean[-1].weight, gain=0.01)
         nn.init.orthogonal_(self.critic[-1].weight,     gain=1.0)
-
+ 
     def forward(self, obs):
         img, vec = obs
         enc   = self.encoder(img, vec)
@@ -222,7 +326,7 @@ class ActorCritic(nn.Module):
         dist  = Normal(mean, std)
         value = self.critic(enc).squeeze(-1)
         return dist, value
-
+ 
     @torch.no_grad()
     def act(self, obs):
         dist, value = self(obs)
@@ -231,6 +335,7 @@ class ActorCritic(nn.Module):
         log_prob    = dist.log_prob(action_raw).sum(-1) \
                       - torch.log(1 - action.pow(2) + 1e-6).sum(-1)
         return action, log_prob, value
+ 
 
 
 # ─────────────────────────────────────────────
@@ -442,6 +547,10 @@ class PPOTrainer:
         recent_rewards = deque(maxlen=20)
         global_step, rollout_idx = 0, 0
         start_time = time.time()
+        
+        number_of_crashes = 0
+        crash_penalty_running_sum = 0
+        crash_speed_running_sum = 0
 
         while global_step < total_steps:
             # ── collect rollout ──────────────────────────────────────
@@ -452,15 +561,20 @@ class PPOTrainer:
                     action, log_prob, value = self.policy.act((img_t, vec_t))
 
                 action_np = action.squeeze(0).cpu().numpy()
-                next_obs, reward, terminated, truncated, _ = env.step(action_np)
+                next_obs, reward, terminated, truncated, info = env.step(action_np)
                 done = terminated or truncated
+                
+                if("crash_penalty" in info):
+                    number_of_crashes += 1
+                    crash_penalty_running_sum += info["crash_penalty"]
+                    crash_speed_running_sum += info["crash_speed"]
 
                 self.buffer.add(img_t, vec_t, action, log_prob, reward, value, done)
                 obs        = next_obs
                 ep_reward += reward
                 global_step += 1
 
-                if done:
+                if done: 
                     recent_rewards.append(ep_reward)
                     ep_count  += 1
                     ep_reward  = 0.0
@@ -475,6 +589,10 @@ class PPOTrainer:
                 _, _, last_val = self.policy.act((img_t, vec_t))
             self.buffer.compute_returns(last_val.squeeze(0), self.gamma, self.gae_lambda)
 
+
+            mean_crash_penalty = crash_penalty_running_sum / number_of_crashes if number_of_crashes > 0 else 0
+            mean_crash_speed = crash_speed_running_sum / number_of_crashes if number_of_crashes > 0 else 0
+
             # ── update policy ────────────────────────────────────────
             self.policy.train()
             stats = self._update()
@@ -487,16 +605,20 @@ class PPOTrainer:
                 checkpoint_file = current_run_folder.get_date_file_name("pt", "chkpts")
                 self.save(checkpoint_file)
                 
-                with open(current_run_folder.get_file_name("data.csv")) as f:
-                    f.write(f"{global_step},{mean_rew},{ep_count},{stats['policy_loss']},{stats['value_loss']},{stats['entropy']},{stats['approx_kl']},{global_step / elapsed},\"{checkpoint_file}\"")
+                with open(current_run_folder.get_file_name("data.csv"), "a+") as f:
+                    f.write(f"{global_step},{mean_rew},{ep_count},{stats['policy_loss']},{stats['value_loss']},{stats['entropy']},{stats['approx_kl']},{global_step / elapsed},\"{checkpoint_file}\",{mean_crash_penalty},{mean_crash_speed},{number_of_crashes}\n")
                 
                 print(
-                    f"[{global_step:>8d}] "
+                    f"\n\n[{global_step:>8d}] "
                     f"rew={mean_rew:>8.2f}  ep={ep_count:>4d}  "
                     f"pi={stats['policy_loss']:>7.4f}  V={stats['value_loss']:>7.4f}  "
                     f"H={stats['entropy']:>5.3f}  kl={stats['approx_kl']:>6.4f}  "
-                    f"fps={global_step / elapsed:>5.0f}"
+                    f"fps={global_step / elapsed:>5.0f} crash_penalty={mean_crash_penalty} crash_speed={mean_crash_speed} number_of_crashes={number_of_crashes}\n\n"
                 )
+                
+                number_of_crashes = 0
+                crash_speed_running_sum = 0
+                crash_penalty_running_sum = 0
 
         env.close()
         print("Training complete.")
@@ -524,12 +646,27 @@ if __name__ == "__main__":
     import tmrl
     import pathlib
     from tmrl.config.config_objects import CONFIG_DICT
+    import os
+    # import sys
+    
     print(CONFIG_DICT)
     
-    s = datetime.now().strftime("%Y-%m-%d-%H_%M_%S")
-    current_run_folder = CurrentRunFolder(str(pathlib.Path("runs", s)))
+    folder = "runs/large-model-ppo"
+    current_run_folder = None
+    if(folder is not None):
+        current_run_folder = CurrentRunFolder(str(pathlib.Path(folder)))
+    else:
+        s = datetime.now().strftime("%Y-%m-%d-%H_%M_%S")
+        current_run_folder = CurrentRunFolder(str(pathlib.Path("runs", s)))
+    
     
     env = tmrl.get_environment()
+    # env = CrashPenaltyWrapper(
+    #     tmrl.get_environment(),
+    #     base_penalty = 1.0,   # flat penalty on any crash
+    #     speed_coef   = 0.04,    # extra penalty per km/h at time of crash
+    #     max_penalty  = 5.0,  # cap so one crash cant blow up training
+    # )
 
     trainer, first_obs = PPOTrainer.from_env(
         env,
@@ -540,5 +677,10 @@ if __name__ == "__main__":
         entropy_coef  = 0.001,
     )
 
+    chkpts = sorted(os.listdir(current_run_folder.get_folder("chkpts")))
+    if(0 < len(chkpts)):
+        print(f"Loading old checkpoints \"{str(pathlib.Path(current_run_folder.get_file_name(chkpts[-1], "chkpts")))}\"")
+        trainer.load(current_run_folder.get_file_name(chkpts[-1], "chkpts"))
+    
     trainer.train(env, first_obs=first_obs, total_steps=2_000_000, current_run_folder=current_run_folder)
     trainer.save(current_run_folder.get_file_name("ppo_final.pt", "chkpts"))

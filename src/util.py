@@ -16,6 +16,10 @@ class CurrentRunFolder:
             return str(pathlib.Path(self.run_folder, subfolder, filename))
         return str(pathlib.Path(self.run_folder, filename))
     
+    def get_folder(self, folder: str):
+        os.makedirs(str(pathlib.Path(self.run_folder, folder)), exist_ok=True)
+        return str(pathlib.Path(self.run_folder, folder))
+    
     def get_date_file_name(self, extension:str, subfolder:str|None=None):
         filename = datetime.now().strftime("%Y-%m-%d-%H_%M_%S") + "." + extension
         return self.get_file_name(filename, subfolder)
