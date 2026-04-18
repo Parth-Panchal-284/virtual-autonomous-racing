@@ -40,7 +40,7 @@ import random
 import time
 
 # Reuse obs helpers from ppo_tmrl — assumes both files are in the same directory
-from ppo import split_obs, probe_obs_dims
+from ppo_large import split_obs, probe_obs_dims
 
 from datetime import datetime
 
@@ -488,7 +488,7 @@ class REDQTrainer:
                 action_np = action.squeeze(0).cpu().numpy()
 
             # ── env step ─────────────────────────────────────────────
-            next_obs, reward, terminated, truncated, _ = env.step(action_np)
+            next_obs, reward, terminated, truncated, info = env.step(action_np)
             done = terminated or truncated
 
             # Store raw images as (C,H,W) uint8
@@ -510,6 +510,9 @@ class REDQTrainer:
             global_step += 1
 
             if done:
+                if("termination_reason" in info):
+                    print(f"Terminated: {info["termination_reason"]}")
+                print(f"Terminated, Score: {ep_reward}")
                 recent_rewards.append(ep_reward)
                 ep_count  += 1
                 ep_reward  = 0.0
@@ -590,7 +593,8 @@ class REDQTrainer:
 if __name__ == "__main__":
     try:
         import tmrl
-        from ppo import CrashPenaltyWrapper
+        from crash_penalty import CrashPenaltyWrapper
+        from no_movement_penalty import NoMovementPenalty
         import pathlib
         import os
         
@@ -604,14 +608,18 @@ if __name__ == "__main__":
             current_run_folder = CurrentRunFolder(str(pathlib.Path("runs", s)))
 
         env = tmrl.get_environment()
-        # env = CrashPenaltyWrapper(
-        #     tmrl.get_environment(),
-        #     base_penalty      = 50.0,
-        #     speed_coef        = 1.5,
-        #     max_crash_penalty = 200.0,
-        #     contact_threshold = 0.15,
-        #     wall_penalty      = 8.0,
-        # )
+        env = CrashPenaltyWrapper(
+            env,
+            base_penalty      = 0.0,
+            speed_coef = 0.0,
+            early_stop= True
+            # max_crash_penalty = 200.0,
+            # contact_threshold = 0.15,
+            # wall_penalty      = 8.0,
+        )
+        env = NoMovementPenalty(
+            env, 1, 40
+        )
 
         trainer, first_obs = REDQTrainer.from_env(
             env,
