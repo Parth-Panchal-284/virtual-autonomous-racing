@@ -34,7 +34,6 @@ class NoMovementPenalty:
 
 
         speed     = self._get_speed(obs)
-        print(speed)
         if(self.min_speed < speed):
             self.frames_since_above_min_speed = 0
         if(self.max_frames < self.frames_since_above_min_speed):

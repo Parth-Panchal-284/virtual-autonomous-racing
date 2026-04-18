@@ -54,7 +54,6 @@ class CrashPenaltyWrapper:
         return float(np.array(obs, dtype=np.float32).flatten()[0])
  
     def reset(self, **kwargs):
-        
         self.frames_since_last_crash = 10000
         self.last_speed = 0
         return self.env.reset(**kwargs)

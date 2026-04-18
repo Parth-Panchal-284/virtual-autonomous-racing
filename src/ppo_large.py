@@ -35,13 +35,16 @@ from datetime import datetime
 
 from util import CurrentRunFolder
 
-from crash_penalty import CrashPenaltyWrapper
+from model.ppo.ppo import CNNStream, DualStreamEncoder, VecStream
+from model.ppo.actor_critic import ActorCritic
+
+import tmrl
 
 # ─────────────────────────────────────────────
 # Observation splitter
 # ─────────────────────────────────────────────
 
-def split_obs(obs):
+def split_obs(obs) -> tuple[list[np.ndarray], list[np.ndarray]]:
     """
     Split a tmrl observation tuple into:
       - img_arrays : list of (1, H, W) or (H, W) numpy arrays  (images)
@@ -64,7 +67,7 @@ def split_obs(obs):
     return img_arrays, vec_arrays
 
 
-def obs_to_tensors(obs, device):
+def obs_to_tensors(obs, device) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Returns (img_tensor, vec_tensor) on `device`.
       img_tensor : (1, C, H, W)  stacked grayscale frames, or None
@@ -72,14 +75,10 @@ def obs_to_tensors(obs, device):
     """
     img_arrays, vec_arrays = split_obs(obs)
 
-    img_t = None
-    if img_arrays:
-        img_t = torch.from_numpy(np.array(img_arrays)).to(device)
+    img_t = torch.from_numpy(np.array(img_arrays)).to(device)
 
-    vec_t = None
-    if vec_arrays:
-        vec   = np.concatenate(vec_arrays)
-        vec_t = torch.from_numpy(vec).unsqueeze(0).to(device)      # (1, D)
+    vec   = np.concatenate(vec_arrays)
+    vec_t = torch.from_numpy(vec).unsqueeze(0).to(device)      # (1, D)
 
     return img_t, vec_t
 
@@ -103,153 +102,6 @@ def probe_obs_dims(obs):
         vec_dim = sum(a.flatten().size for a in vec_arrays)
 
     return img_channels, img_h, img_w, vec_dim
-
-
-# ─────────────────────────────────────────────
-# Network building blocks
-# ─────────────────────────────────────────────
-
-class CNNStream(nn.Module):
-    """
-    Deeper CNN for stacked grayscale frames from TrackMania.
-    Wider filters (32->64->128->128) capture richer 3D perspective features
-    compared to the original Nature-DQN (32->64->64).
-    Input : (B, C, H, W)  pixel values in [0, 255]
-    Output: (B, out_dim)
-    """
-    def __init__(self, in_channels: int, img_h: int, img_w: int, out_dim: int = 512):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, 32,  kernel_size=8, stride=4), nn.ReLU(),
-            nn.Conv2d(32,          64,  kernel_size=4, stride=2), nn.ReLU(),
-            nn.Conv2d(64,          128, kernel_size=3, stride=1), nn.ReLU(),
-            nn.Conv2d(128,         128, kernel_size=3, stride=1), nn.ReLU(),
-            nn.Flatten(),
-        )
-        with torch.no_grad():
-            dummy = torch.zeros(1, in_channels, img_h, img_w)
-            flat  = self.conv(dummy).shape[1]
-        self.proj = nn.Sequential(
-            nn.Linear(flat, out_dim), nn.ReLU(),
-            nn.Linear(out_dim, out_dim), nn.ReLU(),
-        )
- 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.proj(self.conv(x / 255.0))
- 
- 
-class VecStream(nn.Module):
-    """
-    Larger MLP for vector observations (speed, gear, lidar history ...).
-    With 8 history frames of lidar (~152 floats), the original 128->64
-    was a severe bottleneck. Now 256->256->128 to preserve lidar detail.
-    Input : (B, D)
-    Output: (B, out_dim)
-    """
-    def __init__(self, vec_dim: int, out_dim: int = 128):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(vec_dim, 256), nn.Tanh(),
-            nn.Linear(256,     256), nn.Tanh(),
-            nn.Linear(256, out_dim), nn.Tanh(),
-        )
- 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-class DualStreamEncoder(nn.Module):
-    """
-    Fuses CNN visual features with MLP state features using a deeper fusion MLP.
-    Two fusion layers instead of one give the network room to learn non-trivial
-    interactions between visual context and vehicle state (e.g. speed + corner ahead).
-    Either stream can be absent (pass None).
-    Output: (B, enc_dim)
-    """
-    def __init__(
-        self,
-        cnn,
-        vec,
-        cnn_out_dim: int,
-        vec_out_dim: int,
-        enc_dim: int = 512,
-    ):
-        super().__init__()
-        self.cnn = cnn
-        self.vec = vec
-        fusion_in = (cnn_out_dim if cnn is not None else 0) + \
-                    (vec_out_dim if vec is not None else 0)
-        self.fusion = nn.Sequential(
-            nn.Linear(fusion_in, enc_dim), nn.ReLU(),
-            nn.Linear(enc_dim,   enc_dim), nn.ReLU(),
-        )
- 
-    def forward(self, img, vec):
-        parts = []
-        if self.cnn is not None and img is not None:
-            parts.append(self.cnn(img))
-        if self.vec is not None and vec is not None:
-            parts.append(self.vec(vec))
-        return self.fusion(torch.cat(parts, dim=-1))
-
-
-# ─────────────────────────────────────────────
-# Actor-Critic
-# ─────────────────────────────────────────────
-
-class ActorCritic(nn.Module):
-    """
-    Dual-stream Actor-Critic with tanh-squashed Gaussian policy.
-    Actions are always in (-1, 1) — safe for tmrl's gamepad interface.
-    """
-    def __init__(self, encoder: DualStreamEncoder, enc_dim: int, action_dim: int):
-        super().__init__()
-        self.encoder = encoder
- 
-        # Deeper actor head: enc -> 512 -> 256 -> action_dim
-        # Two hidden layers let the policy express more nuanced decisions
-        self.actor_mean = nn.Sequential(
-            nn.Linear(enc_dim, 512), nn.Tanh(),
-            nn.Linear(512,     256), nn.Tanh(),
-            nn.Linear(256, action_dim),
-        )
-        # Start with std ~ 0.6 for less chaotic early exploration
-        self.log_std = nn.Parameter(torch.full((action_dim,), -0.5))
- 
-        # Deeper critic head: enc -> 512 -> 256 -> 1
-        # Value estimation benefits from extra capacity to predict long-horizon returns
-        self.critic = nn.Sequential(
-            nn.Linear(enc_dim, 512), nn.Tanh(),
-            nn.Linear(512,     256), nn.Tanh(),
-            nn.Linear(256, 1),
-        )
-        self._init_weights()
- 
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, (nn.Linear, nn.Conv2d)):
-                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
-                nn.init.zeros_(m.bias)
-        nn.init.orthogonal_(self.actor_mean[-1].weight, gain=0.01)
-        nn.init.orthogonal_(self.critic[-1].weight,     gain=1.0)
- 
-    def forward(self, obs):
-        img, vec = obs
-        enc   = self.encoder(img, vec)
-        mean  = self.actor_mean(enc)
-        std   = self.log_std.exp().expand_as(mean)
-        dist  = Normal(mean, std)
-        value = self.critic(enc).squeeze(-1)
-        return dist, value
- 
-    @torch.no_grad()
-    def act(self, obs):
-        dist, value = self(obs)
-        action_raw  = dist.sample()
-        action      = torch.tanh(action_raw)
-        log_prob    = dist.log_prob(action_raw).sum(-1) \
-                      - torch.log(1 - action.pow(2) + 1e-6).sum(-1)
-        return action, log_prob, value
- 
 
 
 # ─────────────────────────────────────────────
@@ -396,11 +248,11 @@ class PPOTrainer:
         print(f"     Vec stream : {vec_str}")
 
     @classmethod
-    def from_env(cls, env, **kwargs):
+    def from_env(cls, env: tmrl.GenericGymEnv, **kwargs):
         """Auto-detect observation dimensions from a live tmrl environment."""
         obs, _ = env.reset()
         img_ch, img_h, img_w, vec_dim = probe_obs_dims(obs)
-        action_dim = env.action_space.shape[0]
+        action_dim = env.action_space.shape[0] # type: ignore
         print(f"Auto-detected: img={'%d×%d×%d' % (img_ch, img_h, img_w) if img_ch else None}  "
               f"vec={vec_dim}  actions={action_dim}")
         trainer = cls(

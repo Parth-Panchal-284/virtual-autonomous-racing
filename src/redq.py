@@ -38,7 +38,9 @@ from torch.distributions import Normal
 from collections import deque
 import random
 import time
+import tmrl
 
+import threading
 # Reuse obs helpers from ppo_tmrl — assumes both files are in the same directory
 from ppo_large import split_obs, probe_obs_dims
 
@@ -463,52 +465,55 @@ class REDQTrainer:
             "alpha":       self.alpha,
             "q_mean":      q_vals.mean().item(),
         }
-
-    # ── main training loop ───────────────────────────────────────────
-
-    def train(self, env, first_obs=None, total_steps: int = 500_000, log_interval: int = 5, current_run_folder: CurrentRunFolder = CurrentRunFolder("./run")):
+        
+    def _update_loop(self, stop_event: threading.Event, stat_queue: list, lock: threading.Lock):
+        """
+        Background thread: runs gradient updates continuously while the
+        main thread steps the environment. This decouples learning from
+        data collection so rtgym's real-time clock is never blocked.
+        """
+        while not stop_event.is_set():
+            if len(self.buffer) < self.batch_size:
+                time.sleep(0.01)   # wait for buffer to fill
+                continue
+ 
+            stats = None
+            for _ in range(self.G):
+                stats = self._update()
+ 
+            if stats is not None:
+                with lock:
+                    stat_queue.append(stats)
+    
+    def train(self, env : tmrl.GenericGymEnv, first_obs=None, total_steps: int = 500_000, log_interval: int = 1_000, current_run_folder: CurrentRunFolder = CurrentRunFolder("./run")):
         obs = first_obs if first_obs is not None else env.reset()[0]
         ep_reward, ep_count = 0.0, 0
-        recent_rewards  = deque(maxlen=20)
-        stat_accum      = {k: [] for k in ("critic_loss", "actor_loss", "alpha", "q_mean")}
+        recent_rewards : deque[float]  = deque(maxlen=20)
+        stat_queue: list = []          # background thread pushes stats here
+        lock            = threading.Lock()
         global_step     = 0
         start_time      = time.time()
-
+ 
         print(f"Warming up for {self.warmup_steps} steps with random actions...")
-
-        while global_step < total_steps:
-            # ── select action ────────────────────────────────────────
-            if global_step < self.warmup_steps:
-                action_np = env.action_space.sample()
-            else:
-                img_t = obs_to_img_tensor(obs, self.device)
-                with torch.no_grad():
-                    latent = self.encoder(img_t)
-                    action, _ = self.actor.act(latent)
-                action_np = action.squeeze(0).cpu().numpy()
-
-            # ── env step ─────────────────────────────────────────────
+        print(f"Gradient updates run in background thread (G={self.G} per cycle).")
+ 
+        # ── start background update thread after warmup ──────────────
+        stop_event   = threading.Event()
+        update_thread = None   # started once warmup is done
+ 
+        for _ in range(self.warmup_steps):
+            action_np = env.action_space.sample()
             next_obs, reward, terminated, truncated, info = env.step(action_np)
+            reward = float(reward)
             done = terminated or truncated
-
-            # Store raw images as (C,H,W) uint8
-            img_arrays, _  = split_obs(obs)
-            next_arrays, _ = split_obs(next_obs)
-            img_np      = np.stack([
-                a[0] if np.array(a).ndim == 3 else np.array(a)
-                for a in img_arrays
-            ], axis=0).astype(np.float32)
-            next_img_np = np.stack([
-                a[0] if np.array(a).ndim == 3 else np.array(a)
-                for a in next_arrays
-            ], axis=0).astype(np.float32)
-
+            img_np      = obs_to_img_tensor(obs,      self.device).squeeze(0).cpu().numpy()
+            next_img_np = obs_to_img_tensor(next_obs, self.device).squeeze(0).cpu().numpy()
             self.buffer.add(img_np, action_np, reward, next_img_np, done)
-
+ 
             obs        = next_obs
             ep_reward += reward
             global_step += 1
-
+ 
             if done:
                 if("termination_reason" in info):
                     print(f"Terminated: {info["termination_reason"]}")
@@ -517,50 +522,101 @@ class REDQTrainer:
                 ep_count  += 1
                 ep_reward  = 0.0
                 obs, _     = env.reset()
+            
+ 
+        update_thread = threading.Thread(
+            target=self._update_loop,
+            args=(stop_event, stat_queue, lock),
+            daemon=True,
+        )
+        update_thread.start()
+        print("Background update thread started.")
 
-            # ── G gradient updates per env step ──────────────────────
-            if global_step >= self.warmup_steps and len(self.buffer) >= self.batch_size:
-                for _ in range(self.G):
-                    stats = self._update()
-                for k in stat_accum:
-                    stat_accum[k].append(stats[k])
 
-            # ── logging ──────────────────────────────────────────────
-            if global_step % log_interval == 0 and stat_accum["critic_loss"]:
-                elapsed  = time.time() - start_time
-                mean_rew = np.mean(recent_rewards) if recent_rewards else float("nan")
-                
+
+        n_crashes = 0
+        n_episodes = 0
+        n_no_motion = 0
+ 
+        while global_step < total_steps:
+            img_t = obs_to_img_tensor(obs, self.device)
+            with torch.no_grad():
+                latent = self.encoder(img_t)
+                action, _ = self.actor.act(latent)
+            action_np = action.squeeze(0).cpu().numpy()
+ 
+            # ── env step (never blocked by gradient updates) ─────────
+            next_obs, reward, terminated, truncated, info = env.step(action_np)
+            reward = float(reward)
+            done = terminated or truncated
+ 
+            img_np      = obs_to_img_tensor(obs,      self.device).squeeze(0).cpu().numpy()
+            next_img_np = obs_to_img_tensor(next_obs, self.device).squeeze(0).cpu().numpy()
+            self.buffer.add(img_np, action_np, reward, next_img_np, done)
+ 
+            obs        = next_obs
+            ep_reward += reward
+            global_step += 1
+ 
+            if done:
+                if("termination_reason" in info):
+                    print(f"Terminated: {info["termination_reason"]}")
+                    match(info["termination_reason"]):
+                        case "no-movement":
+                            n_no_motion += 1
+                        case "crash":
+                            n_crashes += 1
+                n_episodes += 1
+                print(f"Terminated, Score: {ep_reward}")
+                recent_rewards.append(ep_reward)
+                ep_count  += 1
+                ep_reward  = 0.0
+                obs, _     = env.reset()
+ 
+            if global_step % log_interval == 0:
+                with lock:
+                    recent_stats = list(stat_queue)
+                    stat_queue.clear()
+ 
                 checkpoint_file = current_run_folder.get_date_file_name("pt", "chkpts")
                 self.save(checkpoint_file)
                 
-                with open(current_run_folder.get_file_name("data.csv"), "a+") as f:
-                    f.write(f"{global_step},{mean_rew},{ep_count},{np.mean(stat_accum['critic_loss'])},{np.mean(stat_accum['actor_loss'])},{np.mean(stat_accum['alpha'])},{np.mean(stat_accum['q_mean'])},{global_step / elapsed},\"{checkpoint_file}\"\n")
                 
-                # print(
-                #     f"\n\n[{global_step:>8d}] "
-                #     f"rew={mean_rew:>8.2f}  ep={ep_count:>4d}  "
-                #     f"pi={stats['policy_loss']:>7.4f}  V={stats['value_loss']:>7.4f}  "
-                #     f"H={stats['entropy']:>5.3f}  kl={stats['approx_kl']:>6.4f}  "
-                #     f"fps={global_step / elapsed:>5.0f} crash_penalty={mean_crash_penalty} crash_speed={mean_crash_speed} number_of_crashes={number_of_crashes}\n\n"
-                # )
-                
-                
-                print(
-                    f"[{global_step:>7d}] "
-                    f"rew={mean_rew:>8.2f}  ep={ep_count:>4d}  "
-                    f"critic={np.mean(stat_accum['critic_loss']):>7.4f}  "
-                    f"actor={np.mean(stat_accum['actor_loss']):>7.4f}  "
-                    f"alpha={np.mean(stat_accum['alpha']):.4f}  "
-                    f"Q={np.mean(stat_accum['q_mean']):>7.3f}  "
-                    f"fps={global_step / elapsed:>5.0f}"
-                )
-                for k in stat_accum:
-                    stat_accum[k].clear()
-
+                if recent_stats:
+                    elapsed  = time.time() - start_time
+                    mean_rew = np.mean(recent_rewards) if recent_rewards else float("nan")
+                    
+                    with open(current_run_folder.get_file_name("data.csv"), "a+") as f:
+                        f.write(f"{global_step},{mean_rew},{ep_count},"
+                                f"{np.mean([s['critic_loss'] for s in recent_stats])},"
+                                f"{np.mean([s['actor_loss']  for s in recent_stats])},"
+                                f"{np.mean([s['alpha']       for s in recent_stats])},"
+                                f"{np.mean([s['q_mean']          for s in recent_stats])},"
+                                f"{global_step / elapsed},\"{checkpoint_file}\","
+                                f"{n_episodes},{n_crashes},{n_no_motion}"
+                                f"\n")
+                    print(
+                        f"[{global_step:>7d}] "
+                        f"rew={mean_rew:>8.2f}  ep={ep_count:>4d}  "
+                        f"critic={np.mean([s['critic_loss'] for s in recent_stats]):>7.4f}  "
+                        f"actor={np.mean([s['actor_loss']  for s in recent_stats]):>7.4f}  "
+                        f"alpha={np.mean([s['alpha']       for s in recent_stats]):.4f}  "
+                        f"Q={np.mean([s['q_mean']          for s in recent_stats]):>7.3f}  "
+                        f"fps={global_step / elapsed:>5.0f}  "
+                        f"n_eps={n_episodes}  n_crashes={n_crashes}  n_no_motion={n_no_motion}"
+                    )
+                    
+                    n_episodes = 0
+                    n_crashes = 0
+                    n_no_motion = 0
+ 
+        # ── shut down background thread cleanly ──────────────────────
+        stop_event.set()
+        if update_thread is not None:
+            update_thread.join(timeout=5.0)
+ 
         env.close()
         print("Training complete.")
-
-    # ── checkpointing ────────────────────────────────────────────────
 
     def save(self, path: str = "redq_tmrl.pt"):
         torch.save({
@@ -586,18 +642,16 @@ class REDQTrainer:
         print(f"Loaded ← {path}")
 
 
-# ─────────────────────────────────────────────
-# Entry point
-# ─────────────────────────────────────────────
-
 if __name__ == "__main__":
     try:
         import tmrl
-        from crash_penalty import CrashPenaltyWrapper
-        from no_movement_penalty import NoMovementPenalty
+        from envs.crash_penalty import CrashPenaltyWrapper
+        from envs.no_movement_penalty import NoMovementPenalty
         import pathlib
         import os
         
+        import warnings
+        warnings.simplefilter("ignore")
     
         folder = "runs/redq"
         current_run_folder = None
@@ -613,12 +667,9 @@ if __name__ == "__main__":
             base_penalty      = 0.0,
             speed_coef = 0.0,
             early_stop= True
-            # max_crash_penalty = 200.0,
-            # contact_threshold = 0.15,
-            # wall_penalty      = 8.0,
         )
         env = NoMovementPenalty(
-            env, 1, 40
+            env, 2, 40
         )
 
         trainer, first_obs = REDQTrainer.from_env(
