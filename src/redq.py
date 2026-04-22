@@ -41,12 +41,9 @@ import time
 import tmrl
 
 import threading
-# Reuse obs helpers from ppo_tmrl — assumes both files are in the same directory
-from ppo_large import split_obs, probe_obs_dims
-
 from datetime import datetime
 
-from util import CurrentRunFolder
+from util import CurrentRunFolder, split_obs, probe_obs_dims
 
 # ─────────────────────────────────────────────
 # Obs → tensor (image only)
@@ -183,8 +180,11 @@ class Actor(nn.Module):
     tanh-squashed action in (-1, 1)^action_dim with a corrected log-prob.
     """
 
-    LOG_STD_MIN = -5
-    LOG_STD_MAX =  2
+    LOG_STD_MIN = -2
+    LOG_STD_MAX =  3
+    
+    # tmrl action layout: [gas=0, brake=1, steer=2]
+    STEER_IDX = 2
 
     def __init__(self, enc_dim: int, action_dim: int, hidden: int = 512):
         super().__init__()
@@ -201,6 +201,26 @@ class Actor(nn.Module):
                 nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
                 nn.init.zeros_(m.bias)
         nn.init.orthogonal_(self.mean_layer.weight, gain=0.01)
+ 
+        # Boost steering log_std bias so steering starts with std≈2.7 (log_std=1.0)
+        # while gas/brake start at std≈1.0 (log_std=0.0).
+        # This prevents gas/brake gradients from collapsing steering std early.
+        if action_dim > self.STEER_IDX:
+            with torch.no_grad():
+                self.log_std_layer.bias[self.STEER_IDX] = 1.0
+        
+        with torch.no_grad():
+            # Boost steering log_std bias (you already had this, keep it!)
+            if action_dim > self.STEER_IDX:
+                self.log_std_layer.bias[self.STEER_IDX] = 1.0
+            
+            # FORCE THE GAS PEDAL BIAS
+            # A bias of 2.0 passed through the tanh() squash gives ~0.96 (almost full gas!)
+            self.mean_layer.bias[0] = 2.0  
+            
+            # (Optional but recommended) Bias the brake slightly negative so it doesn't ride the brakes
+            if action_dim > 1:
+                self.mean_layer.bias[1] = -1.0
 
     def forward(self, latent: torch.Tensor):
         h       = self.net(latent)
@@ -318,6 +338,7 @@ class REDQTrainer:
         gamma: float    = 0.99,
         tau: float      = 0.005,  # soft target update rate
         alpha: float    = 0.2,    # initial entropy temperature
+        min_alpha: float    = 0.05,   
         auto_alpha: bool = True,  # learn alpha automatically
         target_entropy: float | None = None,
         # buffer
@@ -363,6 +384,7 @@ class REDQTrainer:
 
         # ── auto-alpha (entropy temperature) ────────────────────────
         self.auto_alpha = auto_alpha
+        self.min_alpha = min_alpha
         if auto_alpha:
             self.target_entropy = target_entropy or -float(action_dim)
             self.log_alpha      = torch.tensor(np.log(alpha), requires_grad=True,
@@ -436,8 +458,8 @@ class REDQTrainer:
         self.critic_opt.step()
 
         # ── actor update ─────────────────────────────────────────────
-        latent             = self.encoder(imgs)
-        new_actions, lp    = self.actor(latent)
+        latent = self.encoder(imgs).detach() 
+        new_actions, lp = self.actor(latent)
         # Use mean Q across all N critics for actor gradient
         q_vals             = self.critics(imgs, new_actions).mean(dim=-1, keepdim=True)
         actor_loss         = (self.alpha * lp - q_vals).mean()
@@ -453,6 +475,9 @@ class REDQTrainer:
             self.alpha_opt.zero_grad()
             alpha_loss.backward()
             self.alpha_opt.step()
+            
+            with torch.no_grad():
+                self.log_alpha.clamp_(min=np.log(self.min_alpha))
             self.alpha = self.log_alpha.exp().item()
             alpha_loss = alpha_loss.item()
 
@@ -486,7 +511,7 @@ class REDQTrainer:
                     stat_queue.append(stats)
     
     def train(self, env : tmrl.GenericGymEnv, first_obs=None, total_steps: int = 500_000, log_interval: int = 1_000, current_run_folder: CurrentRunFolder = CurrentRunFolder("./run")):
-        obs = first_obs if first_obs is not None else env.reset()[0]
+        obs = env.reset()[0]
         ep_reward, ep_count = 0.0, 0
         recent_rewards : deque[float]  = deque(maxlen=20)
         stat_queue: list = []          # background thread pushes stats here
@@ -502,7 +527,29 @@ class REDQTrainer:
         update_thread = None   # started once warmup is done
  
         for _ in range(self.warmup_steps):
-            action_np = env.action_space.sample()
+            # img_t = obs_to_img_tensor(obs, self.device)
+            # with torch.no_grad():
+            #     latent = self.encoder(img_t)
+            #     action, _ = self.actor.act(latent)
+            # action_np = np.clip(action.squeeze(0).cpu().numpy() + env.action_space.sample(),-1,1)
+            
+            action_np = np.array([
+                    np.random.uniform(-1.0, 1.0),                               # Gas
+                    np.random.uniform(-1.0, 1.0),                             
+                    np.random.uniform(-1.0, 1.0)       # Steer
+                ])
+            env_action = np.zeros_like(action_np)
+            
+            # Gas: [-1, 1] -> [0, 1]
+            env_action[0] = (action_np[0] + 1.0) / 2.0  
+            
+            # Brake: [-1, 1] -> [-1, 0] (Assuming your action_dim > 1)
+            if self.action_dim > 1:
+                env_action[1] = (action_np[1] - 1.0) / 2.0  
+                
+            # Steer: [-1, 1] -> [-1, 1] (Assuming your action_dim > 2)
+            if self.action_dim > 2:
+                env_action[2] = action_np[2]
             next_obs, reward, terminated, truncated, info = env.step(action_np)
             reward = float(reward)
             done = terminated or truncated
@@ -544,9 +591,22 @@ class REDQTrainer:
                 latent = self.encoder(img_t)
                 action, _ = self.actor.act(latent)
             action_np = action.squeeze(0).cpu().numpy()
+            
+            env_action = np.zeros_like(action_np)
+            
+            # Gas: [-1, 1] -> [0, 1]
+            env_action[0] = (action_np[0] + 1.0) / 2.0  
+            
+            # Brake: [-1, 1] -> [-1, 0] (Assuming your action_dim > 1)
+            if self.action_dim > 1:
+                env_action[1] = (action_np[1] - 1.0) / 2.0  
+                
+            # Steer: [-1, 1] -> [-1, 1] (Assuming your action_dim > 2)
+            if self.action_dim > 2:
+                env_action[2] = action_np[2]
  
             # ── env step (never blocked by gradient updates) ─────────
-            next_obs, reward, terminated, truncated, info = env.step(action_np)
+            next_obs, reward, terminated, truncated, info = env.step(env_action)
             reward = float(reward)
             done = terminated or truncated
  
@@ -653,7 +713,7 @@ if __name__ == "__main__":
         import warnings
         warnings.simplefilter("ignore")
     
-        folder = "runs/redq"
+        folder = "runs/redq3"
         current_run_folder = None
         if(folder is not None):
             current_run_folder = CurrentRunFolder(str(pathlib.Path(folder)))
@@ -662,21 +722,21 @@ if __name__ == "__main__":
             current_run_folder = CurrentRunFolder(str(pathlib.Path("runs", s)))
 
         env = tmrl.get_environment()
-        env = CrashPenaltyWrapper(
-            env,
-            base_penalty      = 0.0,
-            speed_coef = 0.0,
-            early_stop= True
-        )
-        env = NoMovementPenalty(
-            env, 2, 40
-        )
+        # env = CrashPenaltyWrapper(
+        #     env,
+        #     base_penalty      = 0.0,
+        #     speed_coef = 0.0,
+        #     early_stop= True
+        # )
+        # env = NoMovementPenalty(
+        #     env, 2, 40
+        # )
 
         trainer, first_obs = REDQTrainer.from_env(
             env,
             N             = 10,       # ensemble size
             M             = 2,        # in-target subset
-            G             = 20,       # UTD ratio
+            G             = 10,       # UTD ratio
             enc_dim       = 512,
             hidden        = 512,
             lr            = 3e-4,
@@ -685,6 +745,9 @@ if __name__ == "__main__":
             buffer_size   = 200_000,
             batch_size    = 256,
             warmup_steps  = 1_000,
+            alpha         = 0.5,
+            min_alpha     = 0.1,
+            target_entropy= -1.5,
         )
 
         chkpts = sorted(os.listdir(current_run_folder.get_folder("chkpts")))
