@@ -1,134 +1,98 @@
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
 from torch.distributions import Normal
-import functools
-import operator
+import torch.nn.functional as F
 
-def prod(iterable):
-    return functools.reduce(operator.mul, iterable, 1)
+from typing import Callable
 
+class SquashedGaussianActor(nn.Module):
+    LOG_STD_MIN = -5.0
+    LOG_STD_MAX = 2.0
 
-def mlp(sizes, activation, output_activation: type[nn.Module] = nn.Identity):
-    layers = []
-    for j in range(len(sizes) - 1):
-        act = activation if j < len(sizes) - 2 else output_activation
-        layers += [nn.Linear(sizes[j], sizes[j + 1]), act()]
-    return nn.Sequential(*layers)
-
-LOG_STD_MIN = -20
-LOG_STD_MAX = 2
-    
-class SquashedGaussianMLPActor(nn.Module):
-    def __init__(self, observation_space, action_space: int, hidden_sizes: tuple[int, ...]=(256, 256), activation: type[nn.Module]=nn.ReLU):
-        # super().__init__(observation_space, action_space)
-        self.observation_space = observation_space
-        self.action_space = action_space
-        try:
-            dim_obs = sum(prod(s for s in space.shape) for space in observation_space)
-            self.tuple_obs = True
-        except TypeError:
-            dim_obs = prod(observation_space.shape)
-            self.tuple_obs = False
-        dim_act = action_space.shape[0]
-        act_limit = action_space.high[0]
-        self.net = nn.Sequential(
-            
+    def __init__(self, encoder: nn.Module, enc_dim: int, action_dim: int):
+        super(SquashedGaussianActor, self).__init__()
+        self.encoder = encoder
+        self.trunk = nn.Sequential(
+            nn.Linear(enc_dim, 512),
+            nn.ReLU(),
+            nn.Linear(512, 256),
+            nn.ReLU(),
         )
+        self.mean = nn.Linear(256, action_dim)
+        self.log_std = nn.Linear(256, action_dim)
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=0.01)
+                nn.init.zeros_(m.bias)
+        nn.init.orthogonal_(self.mean.weight, gain=0.01)
+
+    def _dist(self, obs: tuple[torch.Tensor, torch.Tensor]):
+        latent = self.encoder(obs[0], obs[1])
+        h = self.trunk(latent)
+        mean = self.mean(h)
+        log_std = self.log_std(h).clamp(self.LOG_STD_MIN, self.LOG_STD_MAX)
+        std = log_std.exp()
+        return Normal(mean, std)
+
+    def sample(self, obs: tuple[torch.Tensor, torch.Tensor]):
+        dist = self._dist(obs)
+        x = dist.rsample()
+        action = torch.tanh(x)
+        logp_pi = dist.log_prob(x).sum(axis=-1, keepdim=True)
+        logp_pi -= (2 * (np.log(2) - x - F.softplus(-2 * x))).sum(axis=1, keepdim=True)
+        return action, logp_pi
+
+    @torch.no_grad()
+    def act(self, obs: tuple[torch.Tensor, torch.Tensor], deterministic: bool = False):
+        dist = self._dist(obs)
+        if deterministic:
+            action = torch.tanh(dist.mean)
+            return action
+        x = dist.rsample()
+        logp_pi = dist.log_prob(x).sum(axis=-1)
+        logp_pi -= (2 * (np.log(2) - x - F.softplus(-2 * x))).sum(axis=1)
+        return torch.tanh(x), logp_pi
+
+
+class QNetwork(nn.Module):
+    def __init__(self, inp_dim : int, encoder: type[nn.Module] | Callable[[], nn.Module]):
+        super(QNetwork, self).__init__()
+        self.encoder = encoder()
+        self.model = nn.Sequential(
+            nn.Linear(inp_dim, 512),
+            nn.ReLU(),
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1),
+        )
+    
+    def forward(self, obs: tuple[torch.Tensor, torch.Tensor], action: torch.Tensor):
+        latent = self.encoder(obs[0], obs[1])
+        x = torch.cat([latent, action], dim=-1)
+        return self.model(x)
         
-        mlp([dim_obs] + list(hidden_sizes), activation, activation)
-        self.mu_layer = nn.Linear(hidden_sizes[-1], dim_act)
-        self.log_std_layer = nn.Linear(hidden_sizes[-1], dim_act)
-        self.act_limit = act_limit
-
-    def forward(self, obs, test=False, with_logprob=True):
-        x = torch.cat(obs, -1) if self.tuple_obs else torch.flatten(obs, start_dim=1)
-        net_out = self.net(x)
-        mu = self.mu_layer(net_out)
-        log_std = self.log_std_layer(net_out)
-        log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
-        std = torch.exp(log_std)
-
-        # Pre-squash distribution and sample
-        pi_distribution = Normal(mu, std)
-        if test:
-            # Only used for evaluating policy at test time.
-            pi_action = mu
-        else:
-            pi_action = pi_distribution.rsample()
-
-        if with_logprob:
-            # Compute logprob from Gaussian, and then apply correction for Tanh squashing.
-            # NOTE: The correction formula is a little bit magic. To get an understanding
-            # of where it comes from, check out the original SAC paper (arXiv 1801.01290)
-            # and look in appendix C. This is a more numerically-stable equivalent to Eq 21.
-            # Try deriving it yourself as a (very difficult) exercise. :)
-            pi_distribution.log_prob
-            logp_pi = pi_distribution.log_prob(pi_action).sum(axis=-1)
-            logp_pi -= (2 * (np.log(2) - pi_action - F.softplus(-2 * pi_action))).sum(axis=1)
-        else:
-            logp_pi = None
-
-        pi_action = torch.tanh(pi_action)
-        pi_action = self.act_limit * pi_action
-
-        # pi_action = pi_action.squeeze()
-
-        return pi_action, logp_pi
-
-    def act(self, obs, test=False):
-        with torch.no_grad():
-            a, _ = self.forward(obs, test, False)
-            res = a.squeeze().cpu().numpy()
-            if not len(res.shape):
-                res = np.expand_dims(res, 0)
-            return res
+class REDQCritic(nn.Module):
+    def __init__(self, encoder: type[nn.Module] | Callable[[], nn.Module], enc_dim: int, action_dim: int, N: int):
+        super(REDQCritic, self).__init__()
+        self.encoder = encoder
         
+        self.N = N
+        self.qs = nn.ModuleList([
+            QNetwork(enc_dim + action_dim, self.encoder)
+            for _ in range(self.N)
+        ])
 
+        self._init_weights()
 
-
-
-class QFunction(nn.Module):
-    def __init__(self, obs_space, act_space, hidden_sizes=(256, 256), activation=nn.ReLU):
-        super().__init__()
-        try:
-            obs_dim = sum(prod(s for s in space.shape) for space in obs_space)
-            self.tuple_obs = True
-        except TypeError:
-            obs_dim = prod(obs_space.shape)
-            self.tuple_obs = False
-        act_dim = act_space.shape[0]
-        self.q = mlp([obs_dim + act_dim] + list(hidden_sizes) + [1], activation)
-
-    def forward(self, obs, act):
-        x = torch.cat((*obs, act), -1) if self.tuple_obs else torch.cat((torch.flatten(obs, start_dim=1), act), -1)
-        q = self.q(x)
-        return torch.squeeze(q, -1)  # Critical to ensure q has right shape.  # FIXME: understand this
-    
-    
-    
-class REDQActorCritic:
-
-    def __init__(self,
-                 observation_space,
-                 action_space,
-                 hidden_sizes=(256, 256),
-                 activation=torch.nn.ReLU,
-                 n: int = 10
-                 ):
-       
-        act_limit = action_space.high[0]
-        self.actor = SquashedGaussianMLPActor(observation_space, action_space, hidden_sizes, activation)
-
-        self.n = n
-        self.qs = torch.nn.ModuleList([
-            QFunction(
-                observation_space, action_space, hidden_sizes, activation
-            )
-        for _ in range(self.n)])
-
-    def act(self, obs, test=False):
-        with torch.no_grad():
-            a, _ = self.actor(obs, test, False)
-            return a.squeeze().cpu().numpy()
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=0.01)
+                nn.init.zeros_(m.bias)
+                
+    def forward(self, obs: tuple[torch.Tensor | None, torch.Tensor | None], action: torch.Tensor):
+        return [ model.forward(obs, action) for model in self.qs]
