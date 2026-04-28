@@ -143,6 +143,7 @@ class SACTrainer:
         critic_lr: float = 3e-4,
         alpha_lr: float = 3e-4,
         init_alpha: float = 0.2,
+        min_alpha: float = 0.0,
         auto_alpha: bool = True,
         target_entropy: float | None = None,
         batch_size: int = 256,
@@ -160,6 +161,7 @@ class SACTrainer:
         self.updates_per_step = updates_per_step
         self.max_grad_norm_actor = max_grad_norm_actor
         self.max_grad_norm_critic = max_grad_norm_critic
+        self.min_alpha = max(0.0, float(min_alpha))
         self.action_dim = action_dim
 
         self.device = (
@@ -201,6 +203,7 @@ class SACTrainer:
         self.auto_alpha = auto_alpha
         if auto_alpha:
             self.target_entropy = target_entropy if target_entropy is not None else -float(action_dim)
+            init_alpha = max(float(init_alpha), self.min_alpha)
             self.log_alpha = torch.tensor(np.log(init_alpha), dtype=torch.float32, requires_grad=True, device=self.device)
             self.alpha_opt = optim.Adam([self.log_alpha], lr=alpha_lr)
             self.alpha = self.log_alpha.exp().item()
@@ -223,11 +226,12 @@ class SACTrainer:
         )
 
         param_count = sum(p.numel() for p in list(self.actor.parameters()) + list(self.critic.parameters()))
-        print(f"SAC  device={self.device}  params={param_count:,}  alpha={self.alpha:.4f}")
+        print(f"SAC  device={self.device}  params={param_count:,}  alpha={self.alpha:.4f} min_alpha={self.min_alpha:.4f}")
         print(
             f"     obs_img={img_shape} vec_dim={vec_dim} action_dim={action_dim} "
             f"batch={batch_size} buffer={buffer_size}"
         )
+        print(f"     target_entropy={self.target_entropy}")
 
     @classmethod
     def from_env(cls, env, **kwargs):
@@ -285,6 +289,9 @@ class SACTrainer:
             self.alpha_opt.zero_grad()
             alpha_loss.backward()
             self.alpha_opt.step()
+            if self.min_alpha > 0.0:
+                min_log_alpha = float(np.log(self.min_alpha))
+                self.log_alpha.data.clamp_(min=min_log_alpha)
             self.alpha = self.log_alpha.exp().item()
             alpha_loss_value = alpha_loss.item()
 
@@ -373,6 +380,7 @@ class SACTrainer:
             if global_step % log_interval == 0:
                 elapsed = time.time() - start_time
                 mean_rew = float(np.mean(recent_rewards)) if recent_rewards else float("nan")
+                target_entropy_log = float(self.target_entropy) if self.target_entropy is not None else float("nan")
 
                 checkpoint_file = current_run_folder.get_date_file_name("pt", "chkpts")
                 self.save(checkpoint_file)
@@ -393,14 +401,14 @@ class SACTrainer:
                         f"{global_step},{mean_rew},{ep_count},"
                         f"{mean_critic},{mean_actor},{mean_alpha},{mean_q},"
                         f"{global_step / elapsed},\"{checkpoint_file}\","
-                        f"{n_episodes},{n_crashes},{n_no_motion}"
+                        f"{n_episodes},{n_crashes},{n_no_motion},{target_entropy_log}"
                         f"\n"
                     )
 
                 print(
                     f"[{global_step:>7d}] rew={mean_rew:>8.2f} ep={ep_count:>4d} "
                     f"critic={mean_critic:>8.4f} actor={mean_actor:>8.4f} "
-                    f"alpha={mean_alpha:>7.4f} Q={mean_q:>8.3f} "
+                    f"alpha={mean_alpha:>7.4f} target_H={target_entropy_log:>7.3f} Q={mean_q:>8.3f} "
                     f"fps={global_step / elapsed:>5.0f} "
                     f"n_eps={n_episodes} n_crashes={n_crashes} n_no_motion={n_no_motion}"
                 )
@@ -437,8 +445,12 @@ class SACTrainer:
 
         if self.auto_alpha and self.log_alpha is not None and ckpt.get("log_alpha") is not None:
             self.log_alpha.data = ckpt["log_alpha"].to(self.device)
+            if self.min_alpha > 0.0:
+                min_log_alpha = float(np.log(self.min_alpha))
+                self.log_alpha.data.clamp_(min=min_log_alpha)
             self.alpha = self.log_alpha.exp().item()
         else:
             self.alpha = float(ckpt.get("alpha", self.alpha))
+            self.alpha = max(self.alpha, self.min_alpha)
 
         print(f"Loaded <- {path}")

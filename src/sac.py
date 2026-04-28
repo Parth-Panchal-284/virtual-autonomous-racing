@@ -6,6 +6,7 @@ import tmrl
 
 from envs.crash_penalty import CrashPenaltyWrapper
 from envs.no_movement_penalty import NoMovementPenalty
+from envs.survival_bonus import SurvivalBonusWrapper
 from model.sac.trainer import SACTrainer
 from util import CurrentRunFolder
 
@@ -16,7 +17,7 @@ if __name__ == "__main__":
     print(CONFIG_DICT)
 
     # Use a separate folder for this architecture/config
-    folder = "runs/SAC_enc256"
+    folder = "runs/SAC_enc256_4"
     if folder is not None:
         current_run_folder = CurrentRunFolder(str(pathlib.Path(folder)))
     else:
@@ -31,20 +32,39 @@ if __name__ == "__main__":
         early_stop=True,
     )
     env = NoMovementPenalty(env, 2, 40)
+    env = SurvivalBonusWrapper(env, bonus_per_step=0.05)
 
+    # trainer, first_obs = SACTrainer.from_env(
+    #     env,
+    #     enc_dim=256,
+    #     gamma=0.995,
+    #     tau=0.005,
+    #     actor_lr=3e-4,
+    #     critic_lr=3e-4,
+    #     alpha_lr=1e-5,
+    #     init_alpha=0.5,
+    #     min_alpha=0.05,
+    #     auto_alpha=True,
+    #     batch_size=256,
+    #     buffer_size=1_000_000,
+    #     warmup_steps=5_000,
+    #     updates_per_step=1,
+    #     max_grad_norm_actor=1.0,
+    #     max_grad_norm_critic=1.0,
+    # )
     trainer, first_obs = SACTrainer.from_env(
         env,
         enc_dim=256,
         gamma=0.99,
-        tau=0.005,
-        actor_lr=5e-5,
-        critic_lr=5e-5,
-        alpha_lr=1e-4,
-        init_alpha=0.2,
+        tau=0.002, #was 0.005
+        actor_lr=3e-5, # was 5e-5
+        critic_lr=3e-5, # was 5e-5
+        alpha_lr=5e-5, # was 1e-5
+        init_alpha=0.15, # was 0.2
         auto_alpha=True,
         batch_size=512,
         buffer_size=500_000,
-        warmup_steps=10_000,
+        warmup_steps=15_000,
         updates_per_step=1,
         max_grad_norm_actor=1.0,
         max_grad_norm_critic=0.5,
