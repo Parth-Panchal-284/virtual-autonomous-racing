@@ -7,7 +7,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 import tmrl
 
 from envs.crash_penalty import CrashPenaltyWrapper
-from envs.no_movement_penalty import NoMovementPenaltyWrapper
+from envs.no_movement_penalty import NoMovementPenalty
 from envs.survival_bonus import SurvivalBonusWrapper
 from model.droq.trainer import DroQTrainer
 from util import CurrentRunFolder
@@ -15,9 +15,14 @@ from util import CurrentRunFolder
 
 if __name__ == "__main__":
     env = tmrl.get_environment()
-    env = CrashPenaltyWrapper(env, penalty=-5.0)
-    env = NoMovementPenaltyWrapper(env, speed_index=0, speed_threshold=0.03, duration=100, penalty=-1.0)
-    env = SurvivalBonusWrapper(env, bonus_per_step=0.02)
+    env = CrashPenaltyWrapper(
+        env,
+        base_penalty=-1.0,
+        speed_coef=-0.005,
+        early_stop=True,
+    )
+    env = NoMovementPenalty(env, 2, 40)
+    env = SurvivalBonusWrapper(env, bonus_per_step=0.05)
 
     current_run_folder = CurrentRunFolder("runs/DROQ_enc256")
 
