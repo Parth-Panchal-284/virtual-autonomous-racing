@@ -56,6 +56,6 @@ This encouraged the agent to move forward, avoid crashes, and remain active in t
 
 The experiments compared PPO, SAC variants, and REDQ configurations under real-time TrackMania constraints.
 
-![Mean reward curves comparing RL algorithms](assets/reward_curves.png)
+![Mean reward curves comparing RL algorithms](assets/reward_curve.png)
 
 The experiments were exploratory and limited by available GPU resources and real-time simulator runtime.
